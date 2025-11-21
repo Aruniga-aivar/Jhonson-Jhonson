@@ -149,7 +149,7 @@ API_PAYLOAD_SCHEMA = {
     "invoice_number": "",
     "invoice_date": "",
     "payment_due_date": "",
-    "payment_terms": "-",
+    "payment_terms": "",
     "vendor_reference_id": "",
     "currency": "",
     "total_invoice_value": 0,
@@ -3642,7 +3642,7 @@ class APIHandler:
                 "invoice_number": freight_data.get("invoice_number", ""),
                 "invoice_date": invoice_date,
                 "payment_due_date": calculated_payment_due_date,  # Use calculated value instead of LLM extraction
-                "payment_terms": freight_data.get("payment_terms", "-"),
+                "payment_terms": freight_data.get("payment_terms", ""),
                 "vendor_reference_id": freight_data.get("vendor_reference_id", ""),
                 "currency": freight_data.get("currency", ""),
                 "total_invoice_value": freight_data.get("total_invoice_value", 0),
@@ -3685,7 +3685,7 @@ class APIHandler:
                 "invoice_number": "",
                 "invoice_date": "",
                 "payment_due_date": calculated_payment_due_date,  # Use calculated value
-                "payment_terms": "-",
+                "payment_terms": "",
                 "vendor_reference_id": "",
                 "currency": "",
                 "total_invoice_value": 0,
