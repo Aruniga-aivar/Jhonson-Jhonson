@@ -2874,23 +2874,27 @@ def validate_and_correct_cities(extracted_info: dict, document_type: str = None)
         document_type: Type of document being processed
     
     Returns:
-        tuple: (corrected_info, validation_passed) where validation_passed is True if cities are valid
+        tuple: (corrected_info, validation_passed, invalid_fields) where:
+            - corrected_info: The corrected data structure
+            - validation_passed: True if all cities are valid
+            - invalid_fields: List of tuples (data_index, shipment_index, field_name) for invalid fields
     """
     # Skip city validation for non-freight documents
     if not document_type or 'freight' not in document_type.lower():
         logger.info("Skipping city validation for non-freight document")
-        return extracted_info, True
+        return extracted_info, True, []
     
     # Load city lists from Excel
     origin_cities, destination_cities = load_city_lists_from_excel()
     
     if not origin_cities or not destination_cities:
         logger.error("Failed to load city lists from Excel. City validation cannot proceed.")
-        return extracted_info, False
+        return extracted_info, False, []
     
     corrected_info = json.loads(json.dumps(extracted_info))  # Deep copy
     validation_passed = True
     cities_corrected = []
+    invalid_fields = []  # Track which specific fields are invalid
     
     logger.info("=== VALIDATING AND CORRECTING CITY NAMES ===")
     logger.info(f"Using {len(origin_cities)} origin cities and {len(destination_cities)} destination cities from Excel")
@@ -2899,9 +2903,9 @@ def validate_and_correct_cities(extracted_info: dict, document_type: str = None)
     if document_type and 'freight' in document_type.lower():
         # Freight invoice structure: data[].shipments[].source_city and destination_city
         if 'data' in corrected_info and isinstance(corrected_info['data'], list):
-            for data_item in corrected_info['data']:
+            for data_idx, data_item in enumerate(corrected_info['data']):
                 if 'shipments' in data_item and isinstance(data_item['shipments'], list):
-                    for shipment in data_item['shipments']:
+                    for shipment_idx, shipment in enumerate(data_item['shipments']):
                         # Validate source_city against Origin Cities (column A)
                         if 'source_city' in shipment:
                             city_field = shipment['source_city']
@@ -2930,9 +2934,11 @@ def validate_and_correct_cities(extracted_info: dict, document_type: str = None)
                                     else:
                                         logger.warning(f"❌ Source city '{original_city}' not found in origin cities list (column A)")
                                         validation_passed = False
+                                        invalid_fields.append((data_idx, shipment_idx, 'source_city'))
                                 else:
                                     logger.warning(f"❌ Source city is empty or missing (mandatory field)")
                                     validation_passed = False
+                                    invalid_fields.append((data_idx, shipment_idx, 'source_city'))
                         
                         # Validate destination_city against Destination Cities (column B)
                         if 'destination_city' in shipment:
@@ -2962,9 +2968,11 @@ def validate_and_correct_cities(extracted_info: dict, document_type: str = None)
                                     else:
                                         logger.warning(f"❌ Destination city '{original_city}' not found in destination cities list (column B)")
                                         validation_passed = False
+                                        invalid_fields.append((data_idx, shipment_idx, 'destination_city'))
                                 else:
                                     logger.warning(f"❌ Destination city is empty or missing (mandatory field)")
                                     validation_passed = False
+                                    invalid_fields.append((data_idx, shipment_idx, 'destination_city'))
     
     # Log results
     if cities_corrected:
@@ -2976,8 +2984,64 @@ def validate_and_correct_cities(extracted_info: dict, document_type: str = None)
         logger.info("✅ City validation passed - all cities match valid list")
     else:
         logger.warning("❌ City validation failed - some cities don't match valid list")
+        if invalid_fields:
+            logger.info(f"Invalid fields: {invalid_fields}")
     
-    return corrected_info, validation_passed
+    return corrected_info, validation_passed, invalid_fields
+
+def merge_city_fields(previous_info: dict, new_info: dict, invalid_fields: list) -> dict:
+    """
+    Merge city fields from new extraction with previous extraction, preserving valid cities.
+    Only updates city fields that were invalid in the previous attempt.
+    
+    Args:
+        previous_info: The previous extraction result with valid cities
+        new_info: The new extraction result from retry
+        invalid_fields: List of tuples (data_index, shipment_index, field_name) for invalid fields
+    
+    Returns:
+        dict: Merged info with valid cities preserved and invalid ones updated
+    """
+    merged_info = json.loads(json.dumps(new_info))  # Start with new info as base
+    
+    # If no invalid fields, return new info as-is
+    if not invalid_fields:
+        return merged_info
+    
+    # Create a set of invalid field identifiers for quick lookup
+    invalid_set = set(invalid_fields)
+    
+    # Preserve valid cities from previous attempt, only update invalid ones
+    if 'data' in previous_info and 'data' in merged_info:
+        if isinstance(previous_info['data'], list) and isinstance(merged_info['data'], list):
+            for data_idx in range(min(len(previous_info['data']), len(merged_info['data']))):
+                prev_data = previous_info['data'][data_idx]
+                merged_data = merged_info['data'][data_idx]
+                
+                if 'shipments' in prev_data and 'shipments' in merged_data:
+                    if isinstance(prev_data['shipments'], list) and isinstance(merged_data['shipments'], list):
+                        for shipment_idx in range(min(len(prev_data['shipments']), len(merged_data['shipments']))):
+                            prev_shipment = prev_data['shipments'][shipment_idx]
+                            merged_shipment = merged_data['shipments'][shipment_idx]
+                            
+                            # For each city field, check if it was invalid in previous attempt
+                            for field_name in ['source_city', 'destination_city']:
+                                field_key = (data_idx, shipment_idx, field_name)
+                                
+                                if field_key not in invalid_set:
+                                    # This field was valid in previous attempt - preserve it
+                                    if field_name in prev_shipment:
+                                        prev_field = prev_shipment[field_name]
+                                        if isinstance(prev_field, dict) and 'value' in prev_field:
+                                            prev_value = prev_field.get('value', '')
+                                            if prev_value:
+                                                logger.info(f"Preserving previous valid {field_name} value: '{prev_value}'")
+                                                merged_shipment[field_name] = json.loads(json.dumps(prev_field))
+                                else:
+                                    # This field was invalid in previous attempt - use new value from retry
+                                    logger.info(f"Using new {field_name} value from retry (was invalid in previous attempt)")
+    
+    return merged_info
 
 # ---------- JSON STRUCTURE VALIDATION FUNCTIONS ----------
 def validate_field_structure(field_value, field_name=""):
@@ -3268,6 +3332,10 @@ def extract_information_with_claude(text: str, textract_kvs: dict, carrier_name:
     schema = get_document_schema(document_type) if document_type else FREIGHT_INVOICE_SCHEMA
     logger.info(f"Using schema for document type: {document_type or 'freight_invoice'}")
     
+    # Variables to store previous results for merging valid cities
+    previous_extracted_info = None
+    previous_invalid_fields = None
+    
     for attempt in range(max_retries + 1):
         try:
             logger.info(f"Starting Claude extraction (attempt {attempt + 1}/{max_retries + 1})")
@@ -3439,12 +3507,27 @@ def extract_information_with_claude(text: str, textract_kvs: dict, carrier_name:
             extracted_info = add_missing_kvs(extracted_info, filtered_kvs)
             
             # Validate and correct city names
-            extracted_info, city_validation_passed = validate_and_correct_cities(extracted_info, document_type)
+            extracted_info, city_validation_passed, invalid_fields = validate_and_correct_cities(extracted_info, document_type)
+            
+            # If this is a retry attempt and we have previous results, merge to preserve valid cities
+            if attempt > 0 and previous_extracted_info is not None and previous_invalid_fields is not None:
+                logger.info("Merging retry results: preserving valid cities from previous attempt")
+                extracted_info = merge_city_fields(previous_extracted_info, extracted_info, previous_invalid_fields)
+                # Re-validate after merging
+                extracted_info, city_validation_passed, invalid_fields = validate_and_correct_cities(extracted_info, document_type)
+                if not city_validation_passed:
+                    logger.warning(f"City validation still failed after merging. Invalid fields: {invalid_fields}")
+                else:
+                    logger.info("✅ City validation passed after merging valid cities from previous attempt")
             
             # Retry if city validation failed and we have attempts left
             if not city_validation_passed:
                 if attempt < max_retries:
                     logger.warning(f"City validation failed. Retrying extraction (attempt {attempt + 1}/{max_retries + 1})")
+                    logger.info(f"Invalid fields to retry: {invalid_fields}")
+                    # Store previous result to preserve valid cities
+                    previous_extracted_info = json.loads(json.dumps(extracted_info))
+                    previous_invalid_fields = invalid_fields.copy()
                     time.sleep(1)
                     continue
                 else:
@@ -4495,6 +4578,10 @@ def extract_information_with_claude_separated(combined_text: str, textract_resul
     # Use freight invoice schema for combined processing
     schema = get_document_schema("freight_invoice")
     
+    # Variables to store previous results for merging valid cities
+    previous_structured_output = None
+    previous_invalid_fields = None
+    
     for attempt in range(max_retries + 1):
         try:
             if attempt > 0:
@@ -4600,12 +4687,27 @@ def extract_information_with_claude_separated(combined_text: str, textract_resul
                 # Don't retry for validation code errors - just proceed with the data
             
             # Validate and correct city names
-            structured_output, city_validation_passed = validate_and_correct_cities(structured_output, "freight_invoice")
+            structured_output, city_validation_passed, invalid_fields = validate_and_correct_cities(structured_output, "freight_invoice")
+            
+            # If this is a retry attempt and we have previous results, merge to preserve valid cities
+            if attempt > 0 and previous_structured_output is not None and previous_invalid_fields is not None:
+                logger.info("Merging retry results: preserving valid cities from previous attempt")
+                structured_output = merge_city_fields(previous_structured_output, structured_output, previous_invalid_fields)
+                # Re-validate after merging
+                structured_output, city_validation_passed, invalid_fields = validate_and_correct_cities(structured_output, "freight_invoice")
+                if not city_validation_passed:
+                    logger.warning(f"City validation still failed after merging. Invalid fields: {invalid_fields}")
+                else:
+                    logger.info("✅ City validation passed after merging valid cities from previous attempt")
             
             # Retry if city validation failed and we have attempts left
             if not city_validation_passed:
                 if attempt < max_retries:
                     logger.warning(f"City validation failed. Retrying extraction (attempt {attempt + 1}/{max_retries + 1})")
+                    logger.info(f"Invalid fields to retry: {invalid_fields}")
+                    # Store previous result to preserve valid cities
+                    previous_structured_output = json.loads(json.dumps(structured_output))
+                    previous_invalid_fields = invalid_fields.copy()
                     time.sleep(1)
                     continue
                 else:
