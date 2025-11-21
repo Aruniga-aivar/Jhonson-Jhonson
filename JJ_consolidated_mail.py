@@ -16,7 +16,6 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 from email.utils import formatdate, make_msgid
-from collections import defaultdict
 
 import boto3
 from boto3.dynamodb.conditions import Key, Attr
@@ -48,11 +47,11 @@ FROM_EMAIL_JNJ = os.environ.get("FROM_EMAIL_JNJ", "")
 
 # Email recipients - J&J recipients only
 JNJ_RECIPIENTS = [
-   "Shashank.tiwari@pando.ai",
-    "sadhanand.moorthy@pando.ai",
-    "CString3@ITS.JNJ.com",
-    "PPearson@ITS.JNJ.com",
-    "jeeva@pando.ai" 
+     "Shashank.tiwari@pando.ai",
+     "sadhanand.moorthy@pando.ai",
+     "CString3@ITS.JNJ.com",
+     "PPearson@ITS.JNJ.com",
+     "jeeva@pando.ai" 
 ]
 
 
@@ -820,288 +819,6 @@ def get_carrier_name_from_email(email):
 #         return False
 
 
-def send_sender_daily_summary_email(sender_email, subject, excel_content, filename, smtp_username, smtp_password, sender_invoices, s3_links, from_email, twenty_four_hours_ago, now, retry_count=3):
-    """Send daily consolidated summary email to individual sender with their invoice report"""
-    try:
-        # Validate email address format FIRST (before creating message)
-        if not sender_email or "@" not in sender_email:
-            logger.error(f"Invalid sender email address: {sender_email}")
-            return False
-        
-        # Validate that we have invoices to send
-        if not sender_invoices or len(sender_invoices) == 0:
-            logger.warning(f"No invoices to send for {sender_email}")
-            return False
-        
-        # Validate Excel content
-        if not excel_content:
-            logger.error(f"Excel content is None or empty for {sender_email}")
-            return False
-        
-        # Create a multipart message and set headers
-        msg = MIMEMultipart("alternative")
-        
-        # Set subject - use the subject passed from lambda_handler (already formatted with date range)
-        # Remove "Re:" prefix if present
-        clean_subject = subject.replace("Re: ", "").replace("re: ", "").strip()
-        msg["Subject"] = clean_subject
-            
-        msg["From"] = from_email
-        msg["To"] = sender_email
-        
-        # Add important email headers for better deliverability
-        msg["Date"] = formatdate(localtime=True)
-        # Generate VERY unique Message-ID with timestamp and sender email hash to avoid deduplication
-        unique_id = hashlib.md5(f"{sender_email}{time.time()}{random.random()}".encode()).hexdigest()[:12]
-        timestamp = int(time.time() * 1000)  # Millisecond precision
-        msg["Message-ID"] = f"<individual-{unique_id}-{timestamp}@{from_email.split('@')[1] if '@' in from_email else 'pibypando.ai'}>"
-        msg["X-Mailer"] = "Pando Invoice Processing System - Individual Sender Report"
-        msg["X-Priority"] = "1"  # High priority (1 = High, 3 = Normal, 5 = Low)
-        msg["Importance"] = "High"  # Outlook/Exchange importance header
-        msg["X-Email-Type"] = "Individual-Daily-Summary"  # Custom header to distinguish from consolidated email
-        msg["X-Report-Type"] = "Personal"  # Additional distinguishing header
-        msg["X-Invoice-Count"] = str(len(sender_invoices))  # Number of invoices in this report
-        
-        # Calculate statistics for this sender
-        status_counts = {"Success": 0, "Failed - API error": 0, "Failed": 0, "Failed-Unclassified Document": 0, "Rejected by system": 0, "Other": 0}
-        for invoice in sender_invoices:
-            combined_status = combine_status_values(
-                invoice.get("api_status", ""),
-                invoice.get("status", ""),
-                invoice.get("field_status", ""),
-                invoice.get("missing_critical_field", 0)
-            )
-            if combined_status in status_counts:
-                status_counts[combined_status] += 1
-            else:
-                status_counts["Other"] += 1
-        
-        total_invoices = len(sender_invoices)
-        success_count = status_counts["Success"]
-        rejected_count = status_counts["Rejected by system"]
-        failed_count = status_counts["Failed - API error"] + status_counts["Failed"] + status_counts["Failed-Unclassified Document"]
-        
-        # Create sender-specific HTML content (without HTML table - Excel file already contains all details)
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="UTF-8">
-            <style>
-                body {{
-                    font-family: Arial, sans-serif;
-                    line-height: 1.6;
-                    color: #333;
-                    max-width: 1200px;
-                    margin: 0 auto;
-                    padding: 20px;
-                }}
-                .header {{
-                    padding: 20px 0;
-                    margin-bottom: 20px;
-                    border-bottom: 1px solid #ccc;
-                }}
-                .summary {{
-                    padding: 15px 0;
-                    margin-bottom: 20px;
-                }}
-                .footer {{
-                    margin-top: 30px;
-                    padding-top: 20px;
-                    border-top: 1px solid #ccc;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <h2 style="margin: 0;">Your Daily Invoice Summary</h2>
-                <p style="margin: 5px 0 0 0;">Generated on {now.strftime('%Y-%m-%d %H:%M:%S IST')}</p>
-            </div>
-            
-            <div class="summary">
-                <p>Dear Valued Customer,</p>
-                <p>Kindly find your consolidated invoice submission report for today ({twenty_four_hours_ago.strftime('%Y-%m-%d %H:%M')} to {now.strftime('%Y-%m-%d %H:%M')}).</p>
-                <p>This report contains <strong>{total_invoices}</strong> invoice(s) that you submitted today.</p>
-                <p>The Excel file attached provides the complete details of each invoice along with its processing status. Please review the Excel attachment for all invoice information.</p>
-                <p>In case the status of any invoice is rejected, please resubmit the invoice after making necessary corrections as suggested in the Excel file.</p>
-            </div>
-            
-            <div class="footer">
-                <p><strong>Please send revised invoices after making necessary corrections to:</strong></p>
-                <ul>
-                    <li>invoices.jnjnorthamerica@pibypando.ai (J&J)</li>
-                </ul>
-                <p>This report was generated automatically. Please contact support if you have any questions.</p>
-                <p>Best regards,<br>Pando Invoice Processing System</p>
-            </div>
-        </body>
-        </html>
-        """
-
-        # Create plain text version
-        plain_text = f"""
-Daily Invoice Summary
-Generated on {now.strftime('%Y-%m-%d %H:%M:%S IST')}
-
-Dear Valued Customer,
-
-Kindly find your consolidated invoice submission report for today ({twenty_four_hours_ago.strftime('%Y-%m-%d %H:%M')} to {now.strftime('%Y-%m-%d %H:%M')}).
-
-This report contains {total_invoices} invoice(s) that you submitted today.
-
-The Excel file attached provides the complete details of each invoice along with its processing status. Please review the Excel attachment for all invoice information.
-
-In case the status of any invoice is rejected, please resubmit the invoice after making necessary corrections as suggested in the Excel file.
-
-Please send revised invoices after making necessary corrections to:
-- invoices.jnjnorthamerica@pibypando.ai (J&J)
-
-This report was generated automatically. Please contact support if you have any questions.
-
-Best regards,
-Pando Invoice Processing System
-        """
-
-        # Attach parts into message container
-        part1 = MIMEText(plain_text, "plain")
-        part2 = MIMEText(html_content, "html")
-        msg.attach(part1)
-        msg.attach(part2)
-
-        # Attach Excel file
-        excel_attachment = MIMEBase('application', 'octet-stream')
-        excel_attachment.set_payload(excel_content)
-        encoders.encode_base64(excel_attachment)
-        excel_attachment.add_header('Content-Disposition', 'attachment', filename=filename)
-        msg.attach(excel_attachment)
-        
-        logger.info(f"📎 Excel attachment added: {filename} ({len(excel_content)} bytes)")
-
-        # Check attachment size (some email servers have size limits)
-        attachment_size_mb = len(excel_content) / (1024 * 1024)
-        if attachment_size_mb > 25:  # 25MB is a common email limit
-            logger.warning(f"⚠️  Email attachment is large ({attachment_size_mb:.2f} MB) for {sender_email}. This might cause delivery issues.")
-        
-        logger.info("=" * 80)
-        logger.info(f"📨 INDIVIDUAL EMAIL MESSAGE CONSTRUCTED FOR: {sender_email}")
-        logger.info("=" * 80)
-        logger.info(f"   From: {msg['From']}")
-        logger.info(f"   To: {msg['To']}")
-        logger.info(f"   Subject: {msg['Subject']}")
-        logger.info(f"   Message-ID: {msg['Message-ID']}")
-        logger.info(f"   Priority: {msg['X-Priority']} (High)")
-        logger.info(f"   Importance: {msg['Importance']}")
-        logger.info(f"   X-Email-Type: {msg['X-Email-Type']}")
-        logger.info(f"   X-Report-Type: {msg['X-Report-Type']}")
-        logger.info(f"   X-Invoice-Count: {msg['X-Invoice-Count']}")
-        logger.info(f"   Attachment: {filename} ({attachment_size_mb:.2f} MB)")
-        logger.info("=" * 80)
-        
-        # Add Reply-To header for better email deliverability
-        msg["Reply-To"] = from_email
-        
-        # Send the email via SMTP with retry logic
-        context = ssl.create_default_context()
-        last_exception = None
-        
-        for attempt in range(1, retry_count + 1):
-            try:
-                logger.info(f"Attempting to send email to {sender_email} (attempt {attempt}/{retry_count})")
-                
-                with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as server:
-                    server.set_debuglevel(0)  # Set to 1 for verbose SMTP debugging
-                    server.starttls(context=context)
-                    server.login(smtp_username, smtp_password)
-                    
-                    # send_message returns a dict of failed recipients (empty dict = success)
-                    logger.info("=" * 80)
-                    logger.info(f"🚀 SENDING EMAIL VIA SMTP TO: {sender_email}")
-                    logger.info(f"   SMTP Server: {SMTP_SERVER}:{SMTP_PORT}")
-                    logger.info(f"   Attempt: {attempt}/{retry_count}")
-                    logger.info("=" * 80)
-                    
-                    failed_recipients = server.send_message(msg, to_addrs=[sender_email])
-                    
-                    if failed_recipients:
-                        logger.error("=" * 80)
-                        logger.error(f"❌ EMAIL DELIVERY FAILED for {sender_email} on attempt {attempt}")
-                        logger.error(f"   Failed recipients: {failed_recipients}")
-                        logger.error("=" * 80)
-                        if attempt < retry_count:
-                            time.sleep(2 ** attempt)  # Exponential backoff: 2s, 4s, 8s
-                            continue
-                        return False
-                    
-                    # Log email details for debugging
-                    logger.info("=" * 80)
-                    logger.info(f"✅ ✅ ✅ EMAIL SUCCESSFULLY SENT TO {sender_email}! ✅ ✅ ✅")
-                    logger.info("=" * 80)
-                    logger.info(f"📧 COMPLETE EMAIL DETAILS:")
-                    logger.info(f"   From: {from_email}")
-                    logger.info(f"   To: {sender_email}")
-                    logger.info(f"   Subject: {msg['Subject']}")
-                    logger.info(f"   Message-ID: {msg['Message-ID']}")
-                    logger.info(f"   Priority: HIGH")
-                    logger.info(f"   Attachment: {filename} ({attachment_size_mb:.2f} MB)")
-                    logger.info(f"   Invoice Count: {len(sender_invoices)}")
-                    logger.info("=" * 80)
-                    logger.info(f"✉️  SMTP SERVER ({SMTP_SERVER}) ACCEPTED MESSAGE FOR DELIVERY")
-                    logger.info(f"⚠️  CRITICAL NOTE: Email was successfully sent by AWS Lambda")
-                    logger.info(f"⚠️  and accepted by Microsoft SMTP server for delivery.")
-                    logger.info(f"⚠️  If you don't receive it, it's being filtered by Gmail/Outlook")
-                    logger.info(f"⚠️  CHECK YOUR SPAM/JUNK FOLDER FOR:")
-                    logger.info(f"⚠️     Subject: {msg['Subject']}")
-                    logger.info(f"⚠️     From: {from_email}")
-                    logger.info("=" * 80)
-                    return True
-                    
-            except smtplib.SMTPRecipientsRefused as e:
-                logger.error(f"SMTP recipients refused for {sender_email} on attempt {attempt}: {str(e)}")
-                logger.error(f"Rejected recipients details: {e.recipients}")
-                # Don't retry if recipient is refused - it's a permanent error
-                return False
-            except smtplib.SMTPDataError as e:
-                logger.error(f"SMTP data error for {sender_email} on attempt {attempt}: {str(e)}")
-                logger.error(f"SMTP error code: {e.smtp_code}, message: {e.smtp_error}")
-                last_exception = e
-                if attempt < retry_count:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                    continue
-                return False
-            except smtplib.SMTPServerDisconnected as e:
-                logger.warning(f"SMTP server disconnected for {sender_email} on attempt {attempt}: {str(e)}")
-                last_exception = e
-                if attempt < retry_count:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                    continue
-                return False
-            except smtplib.SMTPAuthenticationError as e:
-                logger.error(f"SMTP authentication error for {sender_email}: {str(e)}")
-                # Don't retry authentication errors - they're permanent
-                return False
-            except smtplib.SMTPException as e:
-                logger.warning(f"SMTP exception for {sender_email} on attempt {attempt}: {str(e)}")
-                last_exception = e
-                if attempt < retry_count:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                    continue
-                return False
-            except Exception as e:
-                logger.warning(f"Unexpected error sending email to {sender_email} on attempt {attempt}: {str(e)}")
-                last_exception = e
-                if attempt < retry_count:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                    continue
-                return False
-        
-        # If we exhausted all retries
-        logger.error(f"Failed to send email to {sender_email} after {retry_count} attempts. Last error: {str(last_exception)}")
-        return False
-        
-    except Exception as e:
-        logger.error(f"Error sending daily summary email to {sender_email}: {str(e)}", exc_info=True)
-        return False
-
 
 def send_client_email(to_emails, subject, body, excel_content, filename, smtp_username, smtp_password, total_invoices, success_count, rejected_count, failed_count, from_email, twenty_four_hours_ago, now, client_name):
     """Send email to multiple clients (Meta, J&J) and Pando with consolidated content"""
@@ -1656,58 +1373,6 @@ def lambda_handler(event, context):
             "jnj_email_sent": 0,
             "jnj_email_failed": 0
         }
-        
-        # Initialize sender_groups for grouping invoices by sender
-        sender_groups = defaultdict(list)
-        
-        # Group invoices by sender email (to_email field) - always do this for reporting
-        logger.info(f"Grouping {len(results)} invoices by sender email for individual summary emails")
-        logger.info("=" * 60)
-        logger.info("DETAILED INVOICE GROUPING ANALYSIS")
-        logger.info("=" * 60)
-        
-        emails_without_valid_address = 0
-        for idx, invoice in enumerate(results, 1):
-            to_email = invoice.get("to_email", "").strip() if invoice.get("to_email") else ""
-            sender_email_fallback = invoice.get("sender_email", "").strip() if invoice.get("sender_email") else ""
-            
-            logger.info(f"[Invoice {idx}/{len(results)}] {invoice.get('invoice_number', 'N/A')}:")
-            logger.info(f"  - to_email from invoice: '{to_email}'")
-            logger.info(f"  - sender_email from invoice: '{sender_email_fallback}'")
-            
-            # Skip placeholder/unknown emails
-            if sender_email_fallback and sender_email_fallback.lower() in ["unknown@example.com", "unknown"]:
-                logger.info(f"  - Clearing sender_email (placeholder detected)")
-                sender_email_fallback = ""
-            
-            # Use to_email as primary, fallback to sender_email
-            final_sender_email = None
-            if to_email and "@" in to_email:
-                final_sender_email = to_email
-                logger.info(f"  ✅ GROUPED using to_email: {to_email}")
-            elif sender_email_fallback and "@" in sender_email_fallback:
-                final_sender_email = sender_email_fallback
-                logger.info(f"  ✅ GROUPED using sender_email: {sender_email_fallback}")
-            else:
-                emails_without_valid_address += 1
-                logger.warning(f"  ❌ NOT GROUPED - No valid email address found!")
-            
-            if final_sender_email:
-                sender_groups[final_sender_email].append(invoice)
-        
-        logger.info("=" * 60)
-        
-        logger.info(f"Grouped invoices into {len(sender_groups)} unique sender groups")
-        if emails_without_valid_address > 0:
-            logger.warning(f"{emails_without_valid_address} invoices could not be grouped due to missing/invalid email addresses")
-        
-        # Log summary of sender groups
-        if sender_groups:
-            logger.info(f"Sender groups summary:")
-            for email, invoices in list(sender_groups.items())[:10]:  # Log first 10 groups
-                logger.info(f"  {email}: {len(invoices)} invoice(s)")
-            if len(sender_groups) > 10:
-                logger.info(f"  ... and {len(sender_groups) - 10} more sender groups")
 
         if email_enabled:
             # Send J&J consolidated email
@@ -1755,138 +1420,6 @@ def lambda_handler(event, context):
                 else:
                     email_results["jnj_email_failed"] = 1
                     logger.warning(f"Failed to send J&J consolidated email to {', '.join(JNJ_RECIPIENTS)}")
-                
-                # Add a delay between consolidated and individual emails to avoid email client deduplication
-                # 5 minute delay to ensure both emails are sent reliably
-                delay_seconds = 300  # 5 minutes
-                logger.info(f"Waiting {delay_seconds} seconds (5 minutes) before sending individual emails to avoid email client deduplication and ensure reliable delivery...")
-                time.sleep(delay_seconds)
-            
-            # Send daily summary emails to individual senders
-            logger.info("=" * 60)
-            logger.info("Sending daily summary emails to individual senders")
-            logger.info("=" * 60)
-            
-            logger.info(f"Found {len(sender_groups)} unique senders to send daily summary emails")
-            if len(sender_groups) == 0:
-                logger.warning(f"⚠️ No sender groups found - {len(results)} invoices processed but no valid email addresses found")
-                logger.warning(f"Debug: Checking invoice email fields...")
-                for invoice in results[:5]:  # Log first 5 invoices for debugging
-                    logger.warning(f"  Invoice {invoice.get('invoice_number', 'N/A')}: to_email='{invoice.get('to_email', '')}', sender_email='{invoice.get('sender_email', '')}'")
-            
-            # Track sender email results
-            sender_email_results = {
-                "sent": 0,
-                "failed": 0,
-                "skipped": 0
-            }
-            
-            # Send daily summary email to each sender
-            sender_list = list(sender_groups.items())
-            logger.info(f"Processing {len(sender_list)} sender groups for individual emails")
-            logger.info("=" * 80)
-            logger.info("SENDER EMAIL VALIDATION & PAYLOAD SUMMARY")
-            logger.info("=" * 80)
-            for idx, (sender_email, sender_invoices) in enumerate(sender_list, 1):
-                sample_invoice_numbers = [inv.get("invoice_number", "N/A") for inv in sender_invoices[:5]]
-                logger.info(
-                    f"[{idx}/{len(sender_list)}] Sender: {sender_email or 'N/A'} | "
-                    f"Invoice count: {len(sender_invoices)} | "
-                    f"Sample invoices: {sample_invoice_numbers}"
-                )
-            logger.info("=" * 80)
-            
-            for idx, (sender_email, sender_invoices) in enumerate(sender_list):
-                try:
-                    # Skip if sender email is invalid
-                    if not sender_email or sender_email.strip() == "":
-                        sender_email_results["skipped"] += 1
-                        logger.warning(f"[{idx+1}/{len(sender_list)}] Skipping sender with empty email address")
-                        continue
-                    
-                    # Note: Internal recipients (J&J team members) will receive BOTH:
-                    # 1. Individual sender summary email (their own invoices)
-                    # 2. J&J consolidated email (all invoices)
-                    # So we do NOT skip them from individual sender emails
-                    
-                    # Skip placeholder/unknown emails
-                    if sender_email.lower() in ["unknown@example.com", "unknown", ""]:
-                        sender_email_results["skipped"] += 1
-                        logger.info(f"[{idx+1}/{len(sender_list)}] Skipping placeholder email: {sender_email}")
-                        continue
-                    
-                    # Validate email format before proceeding
-                    if "@" not in sender_email:
-                        sender_email_results["skipped"] += 1
-                        logger.warning(f"[{idx+1}/{len(sender_list)}] Skipping invalid email format: {sender_email}")
-                        continue
-                    
-                    logger.info(f"[{idx+1}/{len(sender_list)}] Preparing daily summary email for sender: {sender_email} ({len(sender_invoices)} invoices)")
-                    
-                    # Validate that we have invoices
-                    if not sender_invoices or len(sender_invoices) == 0:
-                        sender_email_results["skipped"] += 1
-                        logger.warning(f"[{idx+1}/{len(sender_list)}] Skipping {sender_email} - no invoices to send")
-                        continue
-                    
-                    # Generate Excel file for this sender's invoices
-                    logger.info(f"Generating Excel file for {sender_email}...")
-                    sender_excel_content = generate_excel(sender_invoices, s3_links, f"Daily Invoice Summary - {sender_email}")
-                    
-                    # Validate Excel content was generated successfully
-                    if not sender_excel_content:
-                        sender_email_results["failed"] += 1
-                        logger.error(f"[{idx+1}/{len(sender_list)}] Failed to generate Excel file for {sender_email}")
-                        continue
-                    
-                    logger.info(f"Excel file generated successfully for {sender_email} ({len(sender_excel_content)} bytes)")
-                    sender_filename = f"daily_invoice_summary_{sender_email.replace('@', '_at_').replace('.', '_')}_{date_range_str}.xlsx"
-                    
-                    # Create subject for sender email - matching overall email format
-                    sender_subject = f"Your Personal Invoice Report ({len(sender_invoices)} Invoices) - {twenty_four_hours_ago_ist.strftime('%Y-%m-%d %H:%M IST')} to {now_ist.strftime('%Y-%m-%d %H:%M IST')}"
-                    logger.info(
-                        f"[{idx+1}/{len(sender_list)}] Email payload snapshot -> "
-                        f"To: {sender_email}, Subject: {sender_subject}, "
-                        f"Invoices: {[inv.get('invoice_number', 'N/A') for inv in sender_invoices]}"
-                    )
-                    
-                    # Send daily summary email to sender
-                    logger.info(f"Attempting to send email to {sender_email}...")
-                    sender_email_sent = send_sender_daily_summary_email(
-                        sender_email,
-                        sender_subject,
-                        sender_excel_content,
-                        sender_filename,
-                        smtp_username,
-                        smtp_password,
-                        sender_invoices,
-                        s3_links,
-                        FROM_EMAIL_JNJ,
-                        twenty_four_hours_ago_ist,
-                        now_ist
-                    )
-                    
-                    if sender_email_sent:
-                        sender_email_results["sent"] += 1
-                        logger.info(f"✅ Daily summary email sent successfully to {sender_email}")
-                    else:
-                        sender_email_results["failed"] += 1
-                        logger.warning(f"❌ Failed to send daily summary email to {sender_email}")
-                    
-                    # Add a small delay between emails to avoid rate limiting (except for the last email)
-                    # This helps prevent emails from being filtered as spam
-                    if idx < len(sender_list) - 1:
-                        delay_seconds = 2  # 2 second delay between emails
-                        logger.info(f"Waiting {delay_seconds} seconds before sending next email to avoid rate limiting...")
-                        time.sleep(delay_seconds)
-                        
-                except Exception as e:
-                    sender_email_results["failed"] += 1
-                    logger.error(f"Error sending daily summary email to {sender_email}: {str(e)}", exc_info=True)
-            
-            logger.info(f"Daily summary email results: {sender_email_results['sent']} sent, {sender_email_results['failed']} failed, {sender_email_results['skipped']} skipped")
-            
-            email_results["sender_summary"] = sender_email_results
 
         # Prepare response data
         uploaded_files = [{
@@ -1899,9 +1432,6 @@ def lambda_handler(event, context):
 
         logger.info(f"Consolidated CSV report saved to s3://{OUTPUT_BUCKET}/{all_s3_key}")
         logger.info(f"Email summary: J&J email sent: {email_results.get('jnj_email_sent', 0)}")
-        if "sender_summary" in email_results:
-            sender_summary = email_results["sender_summary"]
-            logger.info(f"Sender daily summaries: {sender_summary.get('sent', 0)} sent, {sender_summary.get('failed', 0)} failed, {sender_summary.get('skipped', 0)} skipped")
 
         return {
             "statusCode": 200,
@@ -1912,8 +1442,7 @@ def lambda_handler(event, context):
                     "date_range": f"{twenty_four_hours_ago_ist.strftime('%Y-%m-%d %H:%M IST')} to {now_ist.strftime('%Y-%m-%d %H:%M IST')}",
                     "files": uploaded_files,
                     "email_summary": email_results,
-                    "jnj_invoice_count": len(jnj_invoices),
-                    "unique_senders_count": len(sender_groups) if email_enabled else 0
+                    "jnj_invoice_count": len(jnj_invoices)
                 },
                 cls=DecimalEncoder
             ),
